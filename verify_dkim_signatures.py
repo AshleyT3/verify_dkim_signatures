@@ -163,20 +163,23 @@ class OurDKIM(dkim.DKIM):
 
 
 def our_dkim_verify(message, logger=None, dnsfunc=dkim.dnsplug.get_txt, minkey=1024,
-        timeout=5, tlsrpt=False, ignore_exp=False):
-    """Verify the first (topmost) DKIM signature on an RFC822 formatted message.
+        timeout=5, tlsrpt=False, ignore_exp=False, idx=0):
+    """Verify a DKIM signature on an RFC822 formatted message.
     @param message: an RFC822 formatted message (with either \\n or \\r\\n line endings)
     @param logger: a logger to which debug info will be written (default None)
     @param timeout: number of seconds for DNS lookup timeout (default = 5)
     @param tlsrpt: message is an RFC 8460 TLS report (default False)
      False: Not a tlsrpt, True: Is a tlsrpt, 'strict': tlsrpt, invalid if
      service type is missing. For signing, if True, length is never used.
+    @param idx: which DKIM-Signature to verify; 0 is the topmost. A message may
+     carry several (e.g. one per signing domain), and each must be verified on
+     its own index — verifying idx=0 repeatedly silently ignores the rest.
     @return: True if signature verifies or False otherwise
     """
     # type: (bytes, any, function, int) -> bool
     d = OurDKIM(message,logger=logger,minkey=minkey,timeout=timeout,tlsrpt=tlsrpt,ignore_exp=ignore_exp)
     try:
-        return d.verify(dnsfunc=dnsfunc)
+        return d.verify(idx=idx,dnsfunc=dnsfunc)
     except dkim.DKIMException as x:
         if logger is not None:
             logger.error("%s" % x)
@@ -513,50 +516,170 @@ class DKIMVerifier:
         return params
     
     
-    def verify_dkim_with_library(self, message_bytes, current_filename=None):
-        """Verify DKIM using the dkimpy library (full verification)."""
+    def verify_dkim_with_library(self, message_bytes, current_filename=None, idx=0):
+        """Verify one DKIM signature (by index) using the dkimpy library.
+
+        @param idx: which DKIM-Signature header to verify (0 = topmost). The
+            caller iterates every signature on the message and passes its
+            index here, so each is independently verified rather than only
+            the first.
+
+        Returns (valid, message, diagnosis) where diagnosis is the dict from
+        ``_diagnose_dkim_failure`` (or a minimal dict on the success path).
+        On failure the diagnosis distinguishes the *reason* — a key that is no
+        longer published (revoked/rotated out) is a fundamentally different
+        outcome from a body that was altered, even though both surface as
+        "verification failed".
+        """
         try:
-            # Create cached DNS function for this verification
+            # One cached DNS function for this verification. The same function
+            # is reused for both the verify and the post-failure diagnosis so
+            # we never re-hit the network or double-count cache statistics.
             cached_dns_func = self.create_cached_dns_function(current_filename)
-            
-            # Verify DKIM signature with cached DNS and detailed error reporting
-            result = our_dkim_verify(message_bytes, 
-                                   logger=self._get_debug_logger() if self.verbose else None, 
+
+            result = our_dkim_verify(message_bytes,
+                                   logger=self._get_debug_logger() if self.verbose else None,
                                    dnsfunc=cached_dns_func,
-                                   ignore_exp=True)
-            
+                                   ignore_exp=True,
+                                   idx=idx)
+
             if result:
-                return True, "DKIM signature verified successfully"
-            else:
-                # Try to get more detailed error information
-                try:
-                    # Re-verify with debug info
-                    import logging
-                    import io
-                    
-                    log_capture = io.StringIO()
-                    handler = logging.StreamHandler(log_capture)
-                    logger = logging.getLogger('dkim')
-                    logger.addHandler(handler)
-                    logger.setLevel(logging.DEBUG)
-                    
-                    our_dkim_verify(message_bytes, logger=logger, ignore_exp=True)
-                    
-                    debug_output = log_capture.getvalue()
-                    logger.removeHandler(handler)
-                    
-                    if debug_output:
-                        return False, f"DKIM verification failed - Debug: {debug_output[:200]}..."
-                    else:
-                        return False, "DKIM signature verification failed (no debug info available)"
-                        
-                except Exception:
-                    return False, "DKIM signature verification failed"
-                
+                return True, "DKIM signature verified successfully", {
+                    'classification': 'VALID',
+                    'body_hash_match': True,
+                    'key_status': 'present',
+                }
+
+            diagnosis = self._diagnose_dkim_failure(message_bytes, idx)
+            return False, diagnosis['message'], diagnosis
+
         except dkim.ValidationError as e:
-            return False, f"DKIM validation error: {str(e)}"
+            return False, f"DKIM validation error: {str(e)}", {
+                'classification': 'VALIDATION_ERROR', 'detail': str(e),
+            }
         except Exception as e:
-            return False, f"DKIM library error: {str(e)}"
+            return False, f"DKIM library error: {str(e)}", {
+                'classification': 'LIBRARY_ERROR', 'detail': str(e),
+            }
+
+    def _key_status_for(self, domain, selector):
+        """Return ('present'|'revoked'|'absent', record) for a (domain, selector).
+
+        Reads the key database, which the just-completed verification has
+        already populated, so this never triggers DNS. Cache keys carry the
+        DNS-form trailing dot on the domain (e.g. "example.com."), so match on
+        the dot-stripped domain plus selector.
+
+        - 'present': a usable public key (non-empty p=) is on record.
+        - 'revoked': a record exists but carries no usable p= value. An empty
+          p= is the RFC 6376 signal that a key has been revoked; signers also
+          publish this for selectors they have rotated away from.
+        - 'absent': no record, or a blank placeholder (e.g. an offline miss, or
+          a lookup that returned nothing).
+        """
+        domain = (domain or '').rstrip('.')
+        record = None
+        for v in self.key_database.values():
+            if v.get('selector') == selector and (v.get('domain') or '').rstrip('.') == domain:
+                record = v
+                break
+        if not record:
+            return 'absent', None
+        key_data = (record.get('key_data') or '').strip()
+        if not key_data:
+            return 'absent', record
+        if (record.get('parsed_key') or {}).get('p', '').strip():
+            return 'present', record
+        # key_data present but no usable p= → empty/revoked record
+        return 'revoked', record
+
+    def _diagnose_dkim_failure(self, message_bytes, idx):
+        """Explain *why* a DKIM signature failed, beyond a boolean.
+
+        Returns a dict: {classification, message, body_hash_match, key_status}.
+
+        The two orthogonal facts that determine everything:
+          - body_hash_match: does the message body still hash to the signed
+            bh=? If yes, the content is byte-for-byte what was signed.
+          - key_status: is the public key still verifiable from DNS?
+
+        From these we separate the genuinely different failure modes:
+          - KEY_REVOKED / KEY_ABSENT: the verification key is no longer
+            available, so the signature can never be re-verified regardless of
+            content. Expected for any message older than the signer's key
+            rotation interval. Not evidence of tampering.
+          - SIGNATURE_INVALID_BODY_INTACT: body matches the signed hash but the
+            signature does not validate against the *currently published* key.
+            Almost always means the signing key was rotated after signing (the
+            published key is newer than the one that signed); a signed header
+            altered in transit produces the same symptom.
+          - BODY_ALTERED: the body no longer hashes to bh=, so the content was
+            modified after signing. The signature correctly fails.
+        """
+        diag = {
+            'classification': 'UNKNOWN',
+            'message': 'DKIM signature verification failed',
+            'body_hash_match': None,
+            'key_status': 'unknown',
+        }
+        try:
+            d = OurDKIM(message_bytes, ignore_exp=True)
+            prep = d.verify_headerprep(idx)
+            if not prep:
+                diag['classification'] = 'NO_SIGNATURE'
+                diag['message'] = 'no DKIM-Signature at this index'
+                return diag
+            sig = prep[0]
+            domain = sig[b'd'].decode('ascii', 'replace')
+            selector = sig[b's'].decode('ascii', 'replace')
+            canon_spec = sig.get(b'c', b'simple/simple')
+            body_canon = canon_spec.split(b'/')[-1].decode('ascii', 'replace')
+            target_bh = sig[b'bh'].decode('ascii', 'replace')
+            # d.body is the CRLF-normalized body dkimpy itself canonicalizes,
+            # so this body-hash check matches dkimpy's internal computation.
+            diag['body_hash_match'] = self._body_hash_matches(d.body, target_bh, body_canon)
+        except Exception as e:
+            diag['classification'] = 'MALFORMED_SIGNATURE'
+            diag['message'] = f'could not parse signature for diagnosis: {e}'
+            return diag
+
+        key_status, _ = self._key_status_for(domain, selector)
+        diag['key_status'] = key_status
+        body_ok = diag['body_hash_match']
+
+        if key_status == 'revoked':
+            diag['classification'] = 'KEY_REVOKED'
+            diag['message'] = (
+                'signing key revoked in DNS (empty p=) — the signer rotated this '
+                'selector out, so the signature can no longer be verified. '
+                + ('Body content is intact (body hash matches the signed value).'
+                   if body_ok else
+                   'Body hash also does not match.')
+            )
+        elif key_status == 'absent':
+            diag['classification'] = 'KEY_ABSENT'
+            diag['message'] = (
+                'no public key published for this selector in DNS — likely rotated '
+                'out or not resolvable, so the signature cannot be verified. '
+                + ('Body content is intact (body hash matches the signed value).'
+                   if body_ok else
+                   'Body hash also does not match.')
+            )
+        elif body_ok:
+            diag['classification'] = 'SIGNATURE_INVALID_BODY_INTACT'
+            diag['message'] = (
+                'body content is intact (body hash matches the signed value) but the '
+                'signature does not validate against the currently published key — '
+                'the signing key was most likely rotated after this message was '
+                'signed, or a signed header was altered in transit.'
+            )
+        else:
+            diag['classification'] = 'BODY_ALTERED'
+            diag['message'] = (
+                'message body was modified after signing (body hash does not match the '
+                'signed value) — the signature correctly fails.'
+            )
+        return diag
 
     def verify_arc_with_library(self, message_bytes, current_filename=None):
         """Verify the ARC chain using dkimpy's arc_verify.
@@ -1471,7 +1594,8 @@ class DKIMVerifier:
                         'raw_header': dkim_header[:100] + '...' if len(dkim_header) > 100 else dkim_header
                     })
                     
-                    valid, message_text = self.verify_dkim_with_library(cleaned_message_bytes, file_path.name)
+                    valid, message_text, diagnosis = self.verify_dkim_with_library(
+                        cleaned_message_bytes, file_path.name, idx=i)
                     verification_method = "dkimpy library (full verification)"
                     if was_cleaned:
                         verification_method += " - Gmail headers cleaned"
@@ -1488,8 +1612,11 @@ class DKIMVerifier:
                         if outcome == 'hit':
                             offline_reason = 'OFFLINE-KEY-MATCHED-VERIFY-FAILED'
                             self.stats['offline_key_matched_verify_failed'] += 1
-                            message_text = (f"key matched in database for {d}:{s} but DKIM "
-                                            f"verification failed (body likely altered)")
+                            # A cached "hit" can itself be a revoked/empty key,
+                            # so defer to the diagnosis rather than assuming the
+                            # body was altered — body_hash_match tells the truth.
+                            message_text = (f"key {d}:{s} present in database but verification "
+                                            f"failed — {diagnosis['message']}")
                         elif outcome in ('OFFLINE-NO-DOMAIN', 'OFFLINE-NO-KEY'):
                             offline_reason = outcome
                             if outcome == 'OFFLINE-NO-DOMAIN':
@@ -1504,7 +1631,10 @@ class DKIMVerifier:
                         'domain': dkim_params.get('d', 'unknown'),
                         'valid': valid,
                         'message': message_text,
-                        'method': verification_method
+                        'method': verification_method,
+                        'classification': diagnosis.get('classification'),
+                        'body_hash_match': diagnosis.get('body_hash_match'),
+                        'key_status': diagnosis.get('key_status'),
                     }
                     if offline_reason:
                         detail['offline_reason'] = offline_reason
@@ -1705,6 +1835,16 @@ class DKIMVerifier:
                         report_lines.append(f"  Verification {verification['signature_index']}: {status}")
                         report_lines.append(f"    Domain: {verification.get('domain', 'unknown')}")
                         report_lines.append(f"    Method: {verification['method']}")
+                        if not verification['valid'] and verification.get('classification'):
+                            report_lines.append(f"    Cause: {verification['classification']}")
+                            bhm = verification.get('body_hash_match')
+                            if bhm is not None:
+                                report_lines.append(
+                                    f"    Body integrity: {'INTACT (body hash matches signed value)' if bhm else 'ALTERED (body hash mismatch)'}"
+                                )
+                            ks = verification.get('key_status')
+                            if ks and ks != 'unknown':
+                                report_lines.append(f"    Public key in DNS: {ks}")
                         report_lines.append(f"    Result: {verification['message']}")
                 
                 # ARC detail — always rendered, since ARC runs on every email
@@ -1894,6 +2034,47 @@ class DKIMVerifier:
             def pct(n):
                 return f"{(n / total) * 100:.1f}%"
 
+            # Failure-cause breakdown — explains *why* failures occurred so an
+            # expected outcome (the signer rotated its key out of DNS, common
+            # for any message older than the rotation interval) isn't read as
+            # tampering. body_hash_match is a file-level fact (all signatures
+            # cover the same body), so the most informative per-signature
+            # classification represents the email. BODY_ALTERED ranks highest
+            # so genuine content modification is never masked by a key issue.
+            cause_rank = [
+                ('BODY_ALTERED',                  'Body altered after signing (content modified)'),
+                ('SIGNATURE_INVALID_BODY_INTACT', 'Body intact; signature unverifiable vs current key (likely key rotation)'),
+                ('KEY_REVOKED',                   'Signing key revoked/rotated out of DNS (expected for older mail)'),
+                ('KEY_ABSENT',                    'No public key in DNS for this selector (rotated out/unresolvable)'),
+            ]
+            rank_index = {code: i for i, (code, _) in enumerate(cause_rank)}
+            cause_counts = {}
+            for r in self.results:
+                if r.get('overall_status') != 'invalid_dkim':
+                    continue
+                best_code, best_i = 'OTHER', len(cause_rank)
+                for det in r.get('verification_details', []):
+                    code = det.get('classification')
+                    idx = rank_index.get(code, len(cause_rank))
+                    if idx < best_i:
+                        best_i, best_code = idx, code
+                cause_counts[best_code] = cause_counts.get(best_code, 0) + 1
+            if cause_counts:
+                report_lines.append("=" * 60)
+                report_lines.append("DKIM FAILURE BREAKDOWN (by email)")
+                report_lines.append("=" * 60)
+                for code, label in cause_rank:
+                    if cause_counts.get(code):
+                        report_lines.append(f"  {cause_counts[code]:>4}  {label}")
+                if cause_counts.get('OTHER'):
+                    report_lines.append(f"  {cause_counts['OTHER']:>4}  Other (verification/parse error)")
+                report_lines.append("")
+                report_lines.append("  Note: revoked/rotated keys and body-intact signature")
+                report_lines.append("  failures are NOT content tampering — the message body is")
+                report_lines.append("  byte-intact; the key needed to re-verify is simply gone.")
+                report_lines.append("  ARC (above) preserves the original verdict in these cases.")
+                report_lines.append("")
+
             report_lines.append("=" * 60)
             report_lines.append("OVERALL VERIFICATION SUMMARY")
             report_lines.append("=" * 60)
@@ -2013,13 +2194,28 @@ def main():
         if args.key_database:
             verifier.save_key_database()
         
-        # If high failure rate, suggest manual extraction test
-        if (verifier.stats['invalid_dkim'] > verifier.stats['valid_dkim'] and 
-            verifier.stats['emails_with_dkim'] > 5):
+        # A high failure rate only points at extraction problems when failures
+        # are NOT explained by unavailable keys. Revoked/rotated keys and
+        # body-intact signature failures are expected for older mail and have
+        # nothing to do with how the .eml was extracted — counting them here
+        # would send the user chasing a non-existent extraction bug. So only
+        # consider failures whose body hash actually mismatches (or that errored
+        # out) as extraction-suspicious.
+        extraction_suspicious = 0
+        for r in verifier.results:
+            if r.get('overall_status') != 'invalid_dkim':
+                continue
+            codes = [d.get('classification') for d in r.get('verification_details', [])]
+            if any(c in ('BODY_ALTERED', 'UNKNOWN', None) for c in codes) and not any(
+                    c in ('KEY_REVOKED', 'KEY_ABSENT', 'SIGNATURE_INVALID_BODY_INTACT') for c in codes):
+                extraction_suspicious += 1
+
+        if extraction_suspicious > 5:
             print("\n" + "="*60)
             print("HIGH DKIM FAILURE RATE DETECTED!")
             print("="*60)
-            print("This likely indicates extraction issues. To test:")
+            print("Several emails failed with a body-hash mismatch, which often")
+            print("indicates an extraction/line-ending problem. To test:")
             print("1. Manually extract one email from your original mbox:")
             print("   formail -1 < your.mbox > test_manual.eml")
             print("2. Test this single file:")

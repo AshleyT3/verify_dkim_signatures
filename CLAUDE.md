@@ -18,6 +18,9 @@ Test corpora live in `ex/` (gitignored).
 Single class `DKIMVerifier`:
 
 - **DKIM** — via `OurDKIM(dkim.DKIM)` subclass adding `ignore_exp=True` (don't fail on expired `x=`).
+  - **Per-signature index**: a message can carry several `DKIM-Signature` headers (one per signing domain). `our_dkim_verify`/`verify_dkim_with_library` take `idx`; the caller loop must pass each signature's index. Verifying `idx=0` only silently ignores the rest — regression to avoid.
+  - **Failure classification** (`_diagnose_dkim_failure`): on any failure, report *why*, not just `False`. Two orthogonal facts drive it: `body_hash_match` (does the body still hash to signed `bh=`? → content intact) and `key_status` (`present`/`revoked`/`absent`, read from the just-populated key DB, no extra DNS). Classes: `KEY_REVOKED` (empty `p=` in DNS = RFC 6376 revocation), `KEY_ABSENT` (no record), `SIGNATURE_INVALID_BODY_INTACT` (body matches but sig fails the current key → almost always the signer rotated keys after signing, or a signed header was altered in transit), `BODY_ALTERED` (body-hash mismatch = real content change). Only `BODY_ALTERED`/error count as extraction-suspicious for the "high failure rate" hint.
+  - **Key rotation is the normal cause of old-mail DKIM failure.** Signers rotate/revoke DKIM keys (commonly ~every 6 months); once the signing key leaves DNS, historic mail is permanently unverifiable even though the body is byte-intact. This is expected, not tampering — and it's exactly what ARC is for (the receiving provider froze the original `dkim=pass` verdict into the seal at delivery time, so ARC still passes when live DKIM no longer can).
 - **ARC** — via `dkim.arc_verify` directly. Effective status rolled up from raw `cv`:
   - `PASS` — full chain validates
   - `PARTIAL` — all seals valid but body-hash AMS failed → body mutated *after* ARC signing (Microsoft download path)
