@@ -42,8 +42,14 @@ The opt-in fix mode (`--attempt-fix`) tries to reverse every modification this s
 # Verify a directory of .eml files (uses DNS for keys, caches them locally):
 python verify_dkim_signatures.py ./emails/
 
+# Or name the files directly -- any mix of names, globs and directories:
+python verify_dkim_signatures.py a.eml b.eml "report*.eml" ./archive/
+
+# Every .eml in the current directory (the default when nothing is named):
+python verify_dkim_signatures.py
+
 # One file with full detail and a saved report:
-python verify_dkim_signatures.py --single-file foo.eml --output report.txt ./emails/
+python verify_dkim_signatures.py foo.eml --output report.txt
 
 # Reverse known mutations on Outlook.com / Hotmail downloads so signatures verify again:
 python verify_dkim_signatures.py --attempt-fix ./emails/
@@ -59,16 +65,37 @@ python verify_dkim_signatures.py --json - ./emails/
 
 | Flag | Purpose |
 |------|---------|
-| `<directory>` | directory of `.eml` files to scan |
+| `[SPEC ...]` | files to verify: names, globs (`"mail*.eml"`), or directories (every `.eml` directly inside). Defaults to `*.eml` in the current directory |
+| `--recurse` | match each spec's pattern in its directory and every directory below it |
+| `--include-fixed` | also verify the `.fixed.eml` sidecars that `--attempt-fix` writes (skipped by default) |
 | `--verbose`, `-v` | per-email detail in console output |
 | `--output PATH`, `-o PATH` | also write the report to a UTF-8 file (implies detail) |
 | `--key-database PATH` | persistent key cache (always on; defaults to `./key-database.json`) |
-| `--single-file FILE` | verify one file instead of scanning a directory |
+| `--single-file FILE` | deprecated -- name the file as a positional spec instead; still accepted, and repeatable |
 | `--attempt-fix` | reverse known body mutations on Outlook.com / Hotmail downloads; writes `<name>.fixed.eml` when reconstruction matches the signed hash |
-| `--replace`, `-r` | with `--attempt-fix`: overwrite the original `.eml` in place (destructive) |
+| `--replace` | with `--attempt-fix`: overwrite the original `.eml` in place (destructive) |
 | `--offline-only` | never query DNS; verify against cached keys only |
 | `--overwrite-keys` | allow DNS to refresh cached keys (off by default — cached keys are kept forever) |
 | `--json PATH` | also emit the complete per-file results as JSON; `-` sends them to stdout |
+
+## Naming the files to verify
+
+Positional arguments are file specs, so one mental model covers every case: a
+filename, a glob, or a directory (which means every `.eml` directly inside it).
+They can be mixed freely and are de-duplicated, so `a.eml "b*.eml" ./archive/`
+is one run over all three. With no spec at all, `*.eml` in the current
+directory is assumed; `--recurse` walks each spec's directory downward.
+
+Two details worth knowing. The `.fixed.eml` sidecars written by `--attempt-fix`
+are skipped when a glob or directory sweeps them up, so a second run does not
+verify this tool's own output as though it were another delivered message --
+pass `--include-fixed`, or name a sidecar explicitly, to verify one anyway. And
+when a run spans more than one directory, the report identifies each file by
+path rather than bare filename, since two folders can each hold a `message.eml`.
+
+`--single-file` still works but is redundant; `--replace` no longer has the `-r`
+short form, because a letter that used to mean "overwrite my originals" is not
+one to quietly repurpose.
 
 ## Machine-readable output
 

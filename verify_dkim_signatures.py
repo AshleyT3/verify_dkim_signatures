@@ -10,6 +10,7 @@ Requirements:
 """
 
 import sys
+import os
 import email
 import argparse
 import time
@@ -187,6 +188,64 @@ def our_dkim_verify(message, logger=None, dnsfunc=dkim.dnsplug.get_txt, minkey=1
         return False
 
 
+DEFAULT_SPEC = '*.eml'
+
+# Sidecars written by --attempt-fix. A later sweep of *.eml would otherwise
+# verify this tool's own output alongside the originals and count it as another
+# email, so globs and directories skip them; naming one explicitly still works.
+FIXED_SUFFIX = '.fixed.eml'
+
+
+def expand_specs(specs, recurse=False, include_fixed=False):
+    """Expand command-line specs into a sorted, de-duplicated list of files.
+
+    A spec is an existing file, an existing directory (every *.eml directly
+    inside it), or a glob pattern such as "mail*.eml". With recurse, each
+    pattern is matched in the spec's directory and every directory below it.
+
+    Returns:
+        tuple: (list[Path] paths, list[str] warnings about specs that matched
+                nothing)
+    """
+    paths = []
+    seen = set()
+    warnings = []
+
+    def add(path, literal):
+        if not path.is_file():
+            return
+        if not literal and not include_fixed and path.name.lower().endswith(FIXED_SUFFIX):
+            return
+        key = os.path.normcase(str(path.resolve()))
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(path)
+
+    for spec in specs:
+        matched_before = len(paths)
+        spec_path = Path(spec)
+
+        if spec_path.is_file():
+            add(spec_path, literal=True)
+        else:
+            if spec_path.is_dir():
+                base, pattern = spec_path, DEFAULT_SPEC
+            else:
+                base = spec_path.parent if str(spec_path.parent) else Path('.')
+                pattern = spec_path.name or DEFAULT_SPEC
+            if base.is_dir():
+                finder = base.rglob if recurse else base.glob
+                for match in sorted(finder(pattern)):
+                    add(match, literal=False)
+
+        if len(paths) == matched_before:
+            warnings.append(f"No files matched '{spec}'"
+                            + (' (recursive)' if recurse else ''))
+
+    return paths, warnings
+
+
 # Bumped only on a breaking change to the --json payload shape, so consumers
 # can refuse a structure they don't understand.
 JSON_SCHEMA_VERSION = 1
@@ -221,6 +280,9 @@ class DKIMVerifier:
         # Everything human-readable goes here. When JSON is emitted to stdout
         # the caller points this at stderr, so stdout carries only the JSON.
         self.console = console
+        # Set by scan_paths: with files from several directories, a bare
+        # filename no longer identifies a result in the report.
+        self._multi_dir = False
 
         # Key caching
         self.key_cache = {}  # Runtime cache: domain:selector -> key_data
@@ -1725,26 +1787,41 @@ class DKIMVerifier:
 
         return result
     
+    def scan_paths(self, paths):
+        """Verify an explicit list of .eml files, in the order given.
+
+        The single place that counts files and drives the per-file loop, so
+        every entry point -- a directory, a glob, a list of names -- reaches
+        verification and the statistics the same way.
+        """
+        paths = [Path(p) for p in paths]
+        if not paths:
+            print("No .eml files to process.", file=self.console)
+            return
+
+        self._multi_dir = len({str(p.parent.resolve()) for p in paths}) > 1
+        self.stats['total_files'] = len(paths)
+        print(f"Found {len(paths)} .eml files to process...", file=self.console)
+
+        for i, file_path in enumerate(paths, 1):
+            if i % 50 == 0 or self.verbose:
+                print(f"Processing {i}/{len(paths)}: {file_path.name}", file=self.console)
+
+            result = self.verify_email_file(file_path)
+            self.results.append(result)
+
     def scan_directory(self, directory):
-        """Scan directory for .eml files and verify DKIM signatures."""
+        """Verify every .eml file directly inside directory."""
         directory = Path(directory)
         if not directory.exists():
             raise FileNotFoundError(f"Directory not found: {directory}")
-        
-        eml_files = list(directory.glob("*.eml"))
+
+        eml_files = sorted(directory.glob("*.eml"))
         if not eml_files:
             print(f"No .eml files found in {directory}", file=self.console)
             return
-        
-        self.stats['total_files'] = len(eml_files)
-        print(f"Found {len(eml_files)} .eml files to process...", file=self.console)
-        
-        for i, file_path in enumerate(eml_files, 1):
-            if i % 50 == 0 or self.verbose:
-                print(f"Processing {i}/{len(eml_files)}: {file_path.name}", file=self.console)
-            
-            result = self.verify_email_file(file_path)
-            self.results.append(result)
+
+        self.scan_paths(eml_files)
     
     def print_report(self, output_file=None, echo=True):
         """Print DKIM verification report.
@@ -1850,7 +1927,7 @@ class DKIMVerifier:
             report_lines.append("-" * 40)
             
             for result in self.results:
-                report_lines.append(f"File: {result['file']}")
+                report_lines.append(f"File: {self._display_name(result)}")
                 report_lines.append(f"Status: {result['overall_status'].upper()}")
                 
                 if result['dkim_signatures']:
@@ -2139,6 +2216,20 @@ class DKIMVerifier:
                 f.write('\n'.join(report_lines))
             print(f"Report saved to: {output_file}", file=self.console)
 
+    def _display_name(self, result):
+        """How to name a file in the report.
+
+        A bare filename reads best, but stops identifying anything once the
+        run spans directories -- two folders can each hold a message.eml.
+        """
+        if not self._multi_dir:
+            return result['file']
+        path = Path(result['path'])
+        try:
+            return str(path.relative_to(Path.cwd()))
+        except ValueError:
+            return str(path)
+
     def json_report(self):
         """Return the full run as a JSON-serializable dict.
 
@@ -2163,8 +2254,33 @@ class DKIMVerifier:
 
 
 def main():
+    # The help text, the report's verdict glyphs and message headers all carry
+    # characters a legacy console code page cannot encode, and an encode error
+    # raised mid-run aborts it -- losing the report, the key database save and
+    # the JSON write. This runs before the parser so --help is covered too.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, OSError):
+            pass
+
     parser = argparse.ArgumentParser(description='Verify DKIM signatures in extracted .eml files')
-    parser.add_argument('directory', help='Directory containing .eml files')
+    parser.add_argument('specs', nargs='*', default=[], metavar='SPEC',
+                        help='Files to verify: a filename, a glob such as "mail*.eml", '
+                             'or a directory (meaning every *.eml directly '
+                             'inside it). Repeatable, so several names, patterns and '
+                             'directories can be mixed in one run. Defaults to *.eml in '
+                             'the current directory. Quote globs so the shell does not '
+                             'expand them.')
+    parser.add_argument('--recurse', action='store_true',
+                        help="Match each spec's pattern in its directory and every "
+                             'directory below it.')
+    parser.add_argument('--include-fixed', action='store_true',
+                        help='Include the .fixed.eml sidecars written by --attempt-fix. '
+                             'They are skipped by default so a later sweep of *.eml does '
+                             "not re-verify this tool's own output as though it were "
+                             'another delivered message; a sidecar named explicitly is '
+                             'always verified.')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     parser.add_argument('--output', '-o', help='Output report to file')
     parser.add_argument('--key-database', default='./key-database.json',
@@ -2172,7 +2288,10 @@ def main():
                              './key-database.json in the current directory. Created on '
                              'first save if it does not exist. On save, any existing file '
                              'is rotated to <path>.bak (overwriting any prior .bak).')
-    parser.add_argument('--single-file', help='Verify single .eml file (for testing)')
+    parser.add_argument('--single-file', action='append', metavar='FILE',
+                        help='Deprecated: name the file as a positional SPEC instead. '
+                             'Still accepted, and repeatable; each FILE is added to the '
+                             'files to verify.')
     parser.add_argument('--json', dest='json_path', metavar='PATH',
                         help='Also emit the complete per-file results as JSON to PATH, '
                              "or to stdout with '-'. Carries the same facts as the text "
@@ -2193,7 +2312,7 @@ def main():
                              'decode/strip/re-encode for QP-encoded HTML, plus HTML entity '
                              "reversals like &nbsp; → U+00A0). A .fixed.eml is only ever "
                              'written when the body hashes byte-exactly to the signed bh=.')
-    parser.add_argument('--replace', '-r', action='store_true',
+    parser.add_argument('--replace', action='store_true',
                         help='With --attempt-fix: replace the original .eml file in place '
                              'with the reconstructed bytes instead of writing a separate '
                              '<name>.fixed.eml sidecar. Only acts when reconstruction '
@@ -2216,17 +2335,6 @@ def main():
                              'with --offline-only.')
 
     args = parser.parse_args()
-
-    # The report marks verdicts with check/cross glyphs, and both the report and
-    # the JSON can carry non-ASCII from message headers. On a console whose code
-    # page can't encode those, an encode error would abort a completed run --
-    # losing the report and, worse, the JSON written after it. Degrade the
-    # unrepresentable character instead of the whole run.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding='utf-8', errors='replace')
-        except (AttributeError, OSError):
-            pass
 
     # With JSON on stdout, stdout belongs to the JSON alone; everything a human
     # reads moves to stderr so a consumer can parse stdout unconditionally.
@@ -2258,19 +2366,16 @@ def main():
         console=console,
     )
     try:
-        if args.single_file:
-            # Verify single file for testing
-            result = verifier.verify_email_file(Path(args.single_file))
-            verifier.results = [result]
-            verifier.stats['total_files'] = 1
-            if result['overall_status'] == 'has_dkim' or result['overall_status'] == 'valid_dkim':
-                verifier.stats['emails_with_dkim'] = 1
-            if result['overall_status'] == 'valid_dkim':
-                verifier.stats['valid_dkim'] = 1
-            elif result['overall_status'] == 'invalid_dkim':
-                verifier.stats['invalid_dkim'] = 1
-        else:
-            verifier.scan_directory(args.directory)
+        specs = list(args.specs) + list(args.single_file or [])
+        if not specs:
+            specs = [DEFAULT_SPEC]
+
+        paths, spec_warnings = expand_specs(specs, recurse=args.recurse,
+                                            include_fixed=args.include_fixed)
+        for warning in spec_warnings:
+            print(f"Warning: {warning}", file=console)
+
+        verifier.scan_paths(paths)
         
         verifier.print_report(args.output,
                               echo=not json_to_stdout or args.verbose)

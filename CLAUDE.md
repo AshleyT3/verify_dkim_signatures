@@ -6,9 +6,9 @@ DKIM + ARC verification for `.eml` files (Gmail Takeout, Outlook/Hotmail web dow
 
 ```
 pip install dkimpy dnspython
-python verify_dkim_signatures.py <directory> \
+python verify_dkim_signatures.py [SPEC ...] \
     [--output report.txt] [--key-database keys.json] [--json results.json|-] \
-    [--verbose] [--single-file foo.eml] [--attempt-fix]
+    [--verbose] [--recurse] [--include-fixed] [--attempt-fix]
 ```
 
 Test corpora live in `ex/` (gitignored).
@@ -27,6 +27,7 @@ Single class `DKIMVerifier`:
   - `FAIL` — chain itself broken (a seal failed). Hotmail downloads land here because Microsoft mutates its own ARC headers post-sign on hotmail (outlook.com seals stay valid → PARTIAL there).
   - `NONE` — no ARC headers
 - **Key cache** — `key-database.json`, shared DKIM+ARC. Each entry has `roles: ["dkim"|"arc"|both]`. Persistent.
+- **File selection** — positional args are specs (file, glob, or directory meaning `DIR/*.eml`), expanded by `expand_specs` and verified by `scan_paths`, which is the single place that counts files and drives the per-file loop. `scan_directory` is now one caller of it, and the old `--single-file` branch in `main` that re-derived `total_files`/`valid_dkim`/`invalid_dkim` by hand is gone -- those counters are incremented in `verify_email_file` and must not be set twice. `--attempt-fix` sidecars are excluded from glob/directory expansion (not from explicitly named files), or a second run counts the tool's own output as new mail. `--replace` deliberately has no short form: `-r` used to mean it, so reusing the letter for `--recurse` would silently change what an old command line does.
 - **JSON output** (`--json PATH`, `-` for stdout) — `json_report()` returns `{schema_version, generated, options, stats, results}`, where `results` is the list of per-file dicts `verify_email_file` already builds. It is the *only* structured record of verdicts: the key database is a key cache keyed by domain:selector and stores no verdict (its `status` describes the DNS lookup). Two invariants: (1) a new per-file fact goes in the result dict, not only into report prose, or it exists for humans but not for callers; (2) nothing human-readable may `print()` to stdout from inside the class — it goes to `self.console`, which `main` points at stderr when JSON owns stdout. `JSON_SCHEMA_VERSION` bumps only on a breaking shape change.
 - **Console encoding** — `main` reconfigures stdout/stderr to UTF-8 with `errors='replace'`. The report's `✓` recommendation line is unencodable in a legacy console code page, and the resulting encode error aborted an otherwise-finished run from inside the top-level `try` (taking the key-database save and the JSON write with it). Don't remove it.
 - **`clean_gmail_export()`** — strips Gmail mbox export headers preceding the real `Delivered-To:`. **CRITICAL: only searches within the message header section (before the first blank line)**. A previous bug searched the whole body and mangled emails whose `message/rfc822` attachments contained `Delivered-To:` in their body. Don't regress this.
