@@ -3,6 +3,7 @@
 Verify DKIM signatures in extracted email files.
 
 Usage: python verify_dkim_signatures.py <directory> [--verbose] [--output report.txt]
+       [--json results.json|-]
 
 Requirements:
     pip install dkimpy dnspython
@@ -186,16 +187,40 @@ def our_dkim_verify(message, logger=None, dnsfunc=dkim.dnsplug.get_txt, minkey=1
         return False
 
 
+# Bumped only on a breaking change to the --json payload shape, so consumers
+# can refuse a structure they don't understand.
+JSON_SCHEMA_VERSION = 1
+
+
+def _json_default(obj):
+    """Last-resort encoder for values the result dicts may carry.
+
+    The per-file results are assembled from header parsing and the dkim library,
+    so a stray bytes/set can reach the serializer. Coerce rather than raise: a
+    report that loses fidelity on one odd field beats one that doesn't emit.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode('utf-8', errors='replace')
+    if isinstance(obj, (set, frozenset)):
+        return sorted(str(v) for v in obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
+
+
 class DKIMVerifier:
     def __init__(self, verbose=False, key_database_file='./key-database.json',
                  attempt_fix=False, replace_original=False,
-                 offline_only=False, overwrite_keys=False):
+                 offline_only=False, overwrite_keys=False, console=sys.stdout):
         self.verbose = verbose
         self.key_database_file = key_database_file
         self.attempt_fix = attempt_fix
         self.replace_original = replace_original
         self.offline_only = offline_only
         self.overwrite_keys = overwrite_keys
+        # Everything human-readable goes here. When JSON is emitted to stdout
+        # the caller points this at stderr, so stdout carries only the JSON.
+        self.console = console
 
         # Key caching
         self.key_cache = {}  # Runtime cache: domain:selector -> key_data
@@ -249,7 +274,7 @@ class DKIMVerifier:
     
     def log(self, message):
         if self.verbose:
-            print(message)
+            print(message, file=self.console)
     
     def load_key_database(self):
         """Load existing key database from JSON file."""
@@ -1708,21 +1733,25 @@ class DKIMVerifier:
         
         eml_files = list(directory.glob("*.eml"))
         if not eml_files:
-            print(f"No .eml files found in {directory}")
+            print(f"No .eml files found in {directory}", file=self.console)
             return
         
         self.stats['total_files'] = len(eml_files)
-        print(f"Found {len(eml_files)} .eml files to process...")
+        print(f"Found {len(eml_files)} .eml files to process...", file=self.console)
         
         for i, file_path in enumerate(eml_files, 1):
             if i % 50 == 0 or self.verbose:
-                print(f"Processing {i}/{len(eml_files)}: {file_path.name}")
+                print(f"Processing {i}/{len(eml_files)}: {file_path.name}", file=self.console)
             
             result = self.verify_email_file(file_path)
             self.results.append(result)
     
-    def print_report(self, output_file=None):
-        """Print DKIM verification report."""
+    def print_report(self, output_file=None, echo=True):
+        """Print DKIM verification report.
+
+        With echo=False the report is still written to output_file (if given)
+        but not echoed to the console -- used when JSON owns stdout.
+        """
         report_lines = []
         
         # Summary
@@ -2100,14 +2129,38 @@ class DKIMVerifier:
             report_lines.append("")
 
         # Print to console
-        for line in report_lines:
-            print(line)
+        if echo:
+            for line in report_lines:
+                print(line, file=self.console)
         
         # Write to file if specified
         if output_file:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(report_lines))
-            print(f"Report saved to: {output_file}")
+            print(f"Report saved to: {output_file}", file=self.console)
+
+    def json_report(self):
+        """Return the full run as a JSON-serializable dict.
+
+        Carries the same facts as print_report, minus the prose: every
+        per-file result dict verify_email_file built (DKIM verdicts with
+        their failure classification, ARC instances, fix attempts) plus the
+        run-level stats and the options that produced them.
+        """
+        return {
+            'schema_version': JSON_SCHEMA_VERSION,
+            'generated': datetime.now(timezone.utc).isoformat(),
+            'options': {
+                'key_database': str(self.key_database_file),
+                'attempt_fix': self.attempt_fix,
+                'replace_original': self.replace_original,
+                'offline_only': self.offline_only,
+                'overwrite_keys': self.overwrite_keys,
+            },
+            'stats': self.stats,
+            'results': self.results,
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description='Verify DKIM signatures in extracted .eml files')
@@ -2120,6 +2173,17 @@ def main():
                              'first save if it does not exist. On save, any existing file '
                              'is rotated to <path>.bak (overwriting any prior .bak).')
     parser.add_argument('--single-file', help='Verify single .eml file (for testing)')
+    parser.add_argument('--json', dest='json_path', metavar='PATH',
+                        help='Also emit the complete per-file results as JSON to PATH, '
+                             "or to stdout with '-'. Carries the same facts as the text "
+                             'report in machine-readable form: per file, the DKIM verdict '
+                             'for every signature with its failure classification, the ARC '
+                             'chain detail, any fix attempt, plus run-level stats. With '
+                             "'-', stdout carries only the JSON: progress messages move to "
+                             'stderr and the text report is suppressed unless --verbose or '
+                             '--output asks for it. The key database is a key cache, not a '
+                             'results log, so this is the only structured record of '
+                             'verdicts.')
     parser.add_argument('--attempt-fix', action='store_true',
                         help='When DKIM fails, try to reverse known intermediary body '
                              'mutations and write <name>.fixed.eml alongside the original '
@@ -2152,6 +2216,23 @@ def main():
                              'with --offline-only.')
 
     args = parser.parse_args()
+
+    # The report marks verdicts with check/cross glyphs, and both the report and
+    # the JSON can carry non-ASCII from message headers. On a console whose code
+    # page can't encode those, an encode error would abort a completed run --
+    # losing the report and, worse, the JSON written after it. Degrade the
+    # unrepresentable character instead of the whole run.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, OSError):
+            pass
+
+    # With JSON on stdout, stdout belongs to the JSON alone; everything a human
+    # reads moves to stderr so a consumer can parse stdout unconditionally.
+    json_to_stdout = args.json_path == '-'
+    console = sys.stderr if json_to_stdout else sys.stdout
+
     if args.replace and not args.attempt_fix:
         parser.error('--replace requires --attempt-fix')
     if args.offline_only and args.overwrite_keys:
@@ -2160,9 +2241,11 @@ def main():
     
     # Check dependencies
     if not DKIM_AVAILABLE:
-        print("Warning: dkimpy library not available. Using simplified verification.")
-        print("For full DKIM verification, install with: pip install dkimpy dnspython")
-        print()
+        print("Warning: dkimpy library not available. Using simplified verification.",
+              file=console)
+        print("For full DKIM verification, install with: pip install dkimpy dnspython",
+              file=console)
+        print(file=console)
     
     # Run verification
     verifier = DKIMVerifier(
@@ -2172,6 +2255,7 @@ def main():
         replace_original=args.replace,
         offline_only=args.offline_only,
         overwrite_keys=args.overwrite_keys,
+        console=console,
     )
     try:
         if args.single_file:
@@ -2188,7 +2272,18 @@ def main():
         else:
             verifier.scan_directory(args.directory)
         
-        verifier.print_report(args.output)
+        verifier.print_report(args.output,
+                              echo=not json_to_stdout or args.verbose)
+
+        if args.json_path:
+            payload = json.dumps(verifier.json_report(), indent=2,
+                                 default=_json_default, ensure_ascii=False)
+            if json_to_stdout:
+                sys.stdout.write(payload + '\n')
+            else:
+                with open(args.json_path, 'w', encoding='utf-8') as f:
+                    f.write(payload + '\n')
+                print(f"JSON results saved to: {args.json_path}", file=console)
         
         # Save key database if specified
         if args.key_database:
@@ -2211,19 +2306,19 @@ def main():
                 extraction_suspicious += 1
 
         if extraction_suspicious > 5:
-            print("\n" + "="*60)
-            print("HIGH DKIM FAILURE RATE DETECTED!")
-            print("="*60)
-            print("Several emails failed with a body-hash mismatch, which often")
-            print("indicates an extraction/line-ending problem. To test:")
-            print("1. Manually extract one email from your original mbox:")
-            print("   formail -1 < your.mbox > test_manual.eml")
-            print("2. Test this single file:")
-            print(f"   python {sys.argv[0]} --single-file test_manual.eml --verbose")
-            print("3. Compare results to identify extraction issues")
+            print("\n" + "="*60, file=console)
+            print("HIGH DKIM FAILURE RATE DETECTED!", file=console)
+            print("="*60, file=console)
+            print("Several emails failed with a body-hash mismatch, which often", file=console)
+            print("indicates an extraction/line-ending problem. To test:", file=console)
+            print("1. Manually extract one email from your original mbox:", file=console)
+            print("   formail -1 < your.mbox > test_manual.eml", file=console)
+            print("2. Test this single file:", file=console)
+            print(f"   python {sys.argv[0]} --single-file test_manual.eml --verbose", file=console)
+            print("3. Compare results to identify extraction issues", file=console)
             
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=console)
         sys.exit(1)
 
 if __name__ == "__main__":

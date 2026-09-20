@@ -7,7 +7,7 @@ DKIM + ARC verification for `.eml` files (Gmail Takeout, Outlook/Hotmail web dow
 ```
 pip install dkimpy dnspython
 python verify_dkim_signatures.py <directory> \
-    [--output report.txt] [--key-database keys.json] \
+    [--output report.txt] [--key-database keys.json] [--json results.json|-] \
     [--verbose] [--single-file foo.eml] [--attempt-fix]
 ```
 
@@ -27,6 +27,8 @@ Single class `DKIMVerifier`:
   - `FAIL` — chain itself broken (a seal failed). Hotmail downloads land here because Microsoft mutates its own ARC headers post-sign on hotmail (outlook.com seals stay valid → PARTIAL there).
   - `NONE` — no ARC headers
 - **Key cache** — `key-database.json`, shared DKIM+ARC. Each entry has `roles: ["dkim"|"arc"|both]`. Persistent.
+- **JSON output** (`--json PATH`, `-` for stdout) — `json_report()` returns `{schema_version, generated, options, stats, results}`, where `results` is the list of per-file dicts `verify_email_file` already builds. It is the *only* structured record of verdicts: the key database is a key cache keyed by domain:selector and stores no verdict (its `status` describes the DNS lookup). Two invariants: (1) a new per-file fact goes in the result dict, not only into report prose, or it exists for humans but not for callers; (2) nothing human-readable may `print()` to stdout from inside the class — it goes to `self.console`, which `main` points at stderr when JSON owns stdout. `JSON_SCHEMA_VERSION` bumps only on a breaking shape change.
+- **Console encoding** — `main` reconfigures stdout/stderr to UTF-8 with `errors='replace'`. The report's `✓` recommendation line is unencodable in a legacy console code page, and the resulting encode error aborted an otherwise-finished run from inside the top-level `try` (taking the key-database save and the JSON write with it). Don't remove it.
 - **`clean_gmail_export()`** — strips Gmail mbox export headers preceding the real `Delivered-To:`. **CRITICAL: only searches within the message header section (before the first blank line)**. A previous bug searched the whole body and mangled emails whose `message/rfc822` attachments contained `Delivered-To:` in their body. Don't regress this.
 
 ## Microsoft fix (`--attempt-fix`, opt-in)

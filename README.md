@@ -50,6 +50,9 @@ python verify_dkim_signatures.py --attempt-fix ./emails/
 
 # Verify against your cached keys only — no DNS at all (good for archived emails):
 python verify_dkim_signatures.py --offline-only ./emails/
+
+# Machine-readable results for scripting (stdout carries the JSON alone):
+python verify_dkim_signatures.py --json - ./emails/
 ```
 
 ## CLI
@@ -65,6 +68,36 @@ python verify_dkim_signatures.py --offline-only ./emails/
 | `--replace`, `-r` | with `--attempt-fix`: overwrite the original `.eml` in place (destructive) |
 | `--offline-only` | never query DNS; verify against cached keys only |
 | `--overwrite-keys` | allow DNS to refresh cached keys (off by default — cached keys are kept forever) |
+| `--json PATH` | also emit the complete per-file results as JSON; `-` sends them to stdout |
+
+## Machine-readable output
+
+`--json PATH` writes the whole run as a single JSON document, so another script
+can act on the verdicts instead of scraping the text report. `--json -` sends it
+to stdout, where it is the only thing on stdout: progress messages move to
+stderr, and the text report is suppressed unless `--verbose` or `--output` asks
+for it.
+
+The document is `{schema_version, generated, options, stats, results}`, where
+`results` is one entry per file carrying everything the report renders in prose:
+
+- `overall_status` — `valid_dkim` / `invalid_dkim` / `no_dkim` / `error`
+- `verification_details[]` — per signature: `domain`, `valid`, `method`,
+  `message`, and on failure the `classification` (`KEY_REVOKED`, `KEY_ABSENT`,
+  `SIGNATURE_INVALID_BODY_INTACT`, `BODY_ALTERED`) with the two facts behind it,
+  `body_hash_match` and `key_status`
+- `arc` — `effective_status` (`pass`/`partial`/`fail`/`none`), raw `cv`, and the
+  per-instance seal/signature detail
+- `msoft_fix` — present when `--attempt-fix` ran: whether reconstruction
+  succeeded, which phase and variant, and the path written
+- `structure_analysis`, `authentication_results`, `offline_failure_reason`
+
+`schema_version` is bumped only on a breaking change to that shape, so a
+consumer can refuse a structure it doesn't understand.
+
+Note that `key-database.json` cannot substitute for this: it is a cache of
+public keys indexed by domain and selector, and records no verdicts at all. Its
+`status` field describes the DNS lookup, not the signature.
 
 ## The key cache
 
