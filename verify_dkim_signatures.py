@@ -17,19 +17,23 @@ import time
 import dns.resolver
 from pathlib import Path
 import re
-import dkim
-import dkim.dnsplug
-from dkim.canonicalization import Relaxed, Simple
 import hashlib
 import base64
 import quopri
 import json
 from datetime import datetime, timezone
 
+DKIM_INSTALL_HINT = ("this tool needs the dkimpy and dnspython packages; "
+                     "install them with: pip install dkimpy dnspython")
+
 try:
-    DKIM_AVAILABLE = True
-except ImportError:
-    DKIM_AVAILABLE = False
+    import dkim
+    import dkim.dnsplug
+    from dkim.canonicalization import Relaxed, Simple
+    import dns.resolver
+except ImportError as exc:  # pragma: no cover - depends on the environment
+    sys.stderr.write(f"error: {DKIM_INSTALL_HINT} ({exc})\n")
+    raise SystemExit(2)
 
 class OurDKIM(dkim.DKIM):
     def __init__(self, message=None, logger=None, signature_algorithm=b'rsa-sha256', minkey=1024, linesep=b'\r\n', debug_content=False, timeout=5, tlsrpt=False, ignore_exp=False):
@@ -62,7 +66,7 @@ class OurDKIM(dkim.DKIM):
                 raise dkim.ValidationError("b= value is not valid base64 (%s)" % sig[b'b'])
 
         if b'bh' in sig:
-            if re.match(br"[\s0-9A-Za-z+/]+[\s=]*$", sig[b'b']) is None:
+            if re.match(br"[\s0-9A-Za-z+/]+[\s=]*$", sig[b'bh']) is None:
                 raise dkim.ValidationError("bh= value is not valid base64 (%s)" % sig[b'bh'])
             if len(re.sub(br"\s+", b"", sig[b'bh'])) % 4 != 0:
                 raise dkim.ValidationError("bh= value is not valid base64 (%s)" % sig[b'bh'])
@@ -76,7 +80,7 @@ class OurDKIM(dkim.DKIM):
             # No specials, which is close enough
             if re.findall(rb"[\(\)<>\[\]:;@\\,]", sig[b'd']):
                 raise dkim.ValidationError("d= value is not valid (%s)" % sig[b'd'])
-        except UnicodeDecodeError as e:
+        except UnicodeDecodeError:
             # Not an ASCII domain
             pass
 
@@ -250,6 +254,9 @@ def expand_specs(specs, recurse=False, include_fixed=False):
 # can refuse a structure they don't understand.
 JSON_SCHEMA_VERSION = 1
 
+# Reported by --version; keep in step with pyproject.toml.
+VERSION = '1.1.0'
+
 
 def _json_default(obj):
     """Last-resort encoder for values the result dicts may carry.
@@ -287,6 +294,9 @@ class DKIMVerifier:
         # Key caching
         self.key_cache = {}  # Runtime cache: domain:selector -> key_data
         self.key_database = {}  # Persistent database loaded from JSON
+        # True once an entry changed since the last load/save, so a run that
+        # only read keys does not rewrite (and back up) the database.
+        self._db_dirty = False
 
         # Per-file lookup outcomes, cleared at the top of verify_email_file.
         # Maps (domain, selector) -> outcome string. Used to attribute offline
@@ -340,12 +350,16 @@ class DKIMVerifier:
     
     def load_key_database(self):
         """Load existing key database from JSON file."""
+        self._db_dirty = False
         try:
             if Path(self.key_database_file).exists():
                 with open(self.key_database_file, 'r') as f:
-                    self.key_database = json.load(f)
-                    self.stats['keys_loaded'] = len(self.key_database)
-                    self.log(f"Loaded {len(self.key_database)} keys from {self.key_database_file}")
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"expected a JSON object, got {type(loaded).__name__}")
+                self.key_database = loaded
+                self.stats['keys_loaded'] = len(self.key_database)
+                self.log(f"Loaded {len(self.key_database)} keys from {self.key_database_file}")
             else:
                 self.log(f"Key database file {self.key_database_file} not found, starting fresh")
         except Exception as e:
@@ -353,20 +367,47 @@ class DKIMVerifier:
             self.key_database = {}
     
     def save_key_database(self):
-        """Save key database to JSON file.
+        """Save key database to JSON file, atomically, and only when it changed.
 
-        Before writing, rotates any existing file to <path>.bak (overwriting
-        any prior .bak). This preserves the immediately-prior state so the
-        user can revert or diff if a save introduces something unexpected.
+        Two properties this has to hold, both learned the hard way:
+
+        - A read-only run (every key served from cache, or a spec that matched
+          nothing) must not touch the file. Rewriting identical bytes rotated
+          the existing file to <path>.bak on every run, so the one backup of a
+          cache that may no longer be re-fetchable was lost by merely looking
+          at it.
+        - A write must never be able to leave a half-written database. The
+          payload goes to a temp file in the same directory and is moved into
+          place with os.replace(); the previous file is rotated to <path>.bak
+          first, preserving the immediately-prior state so the user can revert
+          or diff if a save introduces something unexpected.
         """
+        if not self._db_dirty:
+            self.log("Key database unchanged, not rewriting")
+            return
+
+        db_path = Path(self.key_database_file)
+        payload = json.dumps(self.key_database, indent=2, sort_keys=True)
+
         try:
-            db_path = Path(self.key_database_file)
+            if db_path.exists() and db_path.read_text(encoding='utf-8') == payload:
+                self._db_dirty = False
+                self.log("Key database already up to date on disk")
+                return
+        except OSError:
+            pass
+
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = db_path.with_suffix(db_path.suffix + '.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(payload)
             if db_path.exists():
                 bak_path = db_path.with_suffix(db_path.suffix + '.bak')
                 db_path.replace(bak_path)
-            with open(self.key_database_file, 'w') as f:
-                json.dump(self.key_database, f, indent=2, sort_keys=True)
-                self.log(f"Saved {len(self.key_database)} keys to {self.key_database_file}")
+            os.replace(tmp_path, db_path)
+            self._db_dirty = False
+            self.log(f"Saved {len(self.key_database)} keys to {self.key_database_file}")
         except Exception as e:
             self.log(f"Error saving key database: {e}")
     
@@ -404,7 +445,12 @@ class DKIMVerifier:
             so the same key can be marked as serving both contexts if observed.
         """
         cache_key = f"{domain}:{selector}"
-        existing = self.key_database.get(cache_key)
+        existing_key, existing = self._database_entry(domain, selector)
+        if existing_key:
+            # Keep writing to the spelling the database already uses, so a
+            # hand-written bare-domain key is updated rather than shadowed by a
+            # second entry for the same selector.
+            cache_key = existing_key
         existing_has_real_key = bool(existing and existing.get('key_data'))
         incoming_has_key = bool(key_data)
 
@@ -436,6 +482,7 @@ class DKIMVerifier:
                 "roles": [],
                 "status": status
             }
+            self._db_dirty = True
             if incoming_has_key:
                 self.stats['keys_saved'] += 1
         elif not existing_has_real_key and incoming_has_key:
@@ -443,22 +490,44 @@ class DKIMVerifier:
             _write_entry_fields(existing, overwriting=False)
             existing['used_by_files'] = existing.get('used_by_files', [])
             existing['roles'] = existing.get('roles', [])
+            self._db_dirty = True
         elif existing_has_real_key and incoming_has_key and self.overwrite_keys:
             # Explicit user opt-in to replace a known-good key with a fresh
             # one. This is the only path that overwrites real key data.
             _write_entry_fields(existing, overwriting=True)
+            self._db_dirty = True
         # else: existing has real key and either (a) incoming is blank or
         # (b) --overwrite-keys not set — leave key_data alone.
 
         # Metadata fields (always allowed)
         entry = self.key_database[cache_key]
-        if "roles" not in entry:
-            entry["roles"] = ["dkim"]
-        if role and role not in entry["roles"]:
-            entry["roles"].append(role)
-        if filename and filename not in entry["used_by_files"]:
-            entry["used_by_files"].append(filename)
+        roles = entry.setdefault("roles", ["dkim"])
+        if role and role not in roles:
+            roles.append(role)
+            self._db_dirty = True
+        used_by = entry.setdefault("used_by_files", [])
+        if filename and filename not in used_by:
+            used_by.append(filename)
+            self._db_dirty = True
     
+    def _database_entry(self, domain, selector):
+        """Return (cache_key, entry) for a (domain, selector), or (None, None).
+
+        Cache keys are built from the DNS query name, which carries the root
+        dot (``example.com.``), but a hand-written or third-party database may
+        well store the bare domain. Both spellings name the same selector, so
+        try the form this tool writes first and the bare one second — otherwise
+        a perfectly usable key sits in the file while every signature is
+        reported as having no key at all.
+        """
+        bare_domain = (domain or '').rstrip('.')
+        for suffix in ('.', ''):
+            candidate = f"{bare_domain}{suffix}:{selector}"
+            entry = self.key_database.get(candidate)
+            if isinstance(entry, dict):
+                return candidate, entry
+        return None, None
+
     def create_cached_dns_function(self, current_filename=None, role="dkim"):
         """Create DNS function that checks the key database first.
 
@@ -499,13 +568,12 @@ class DKIMVerifier:
                     selector = 'unknown'
                     domain = domain_str
 
-            cache_key = f"{domain}:{selector}"
             # _lookup_outcomes is consumed by verify_email_file using the
             # DKIM-Signature d=/s= values, which omit the trailing dot that
             # the DNS query form carries. Normalize on the storage side so
             # the consumer can use the d= value directly.
             outcome_key = (domain.rstrip('.'), selector)
-            entry = self.key_database.get(cache_key)
+            cache_key, entry = self._database_entry(domain, selector)
             has_real_cached_key = bool(entry and entry.get('key_data'))
 
             # Path 1: usable cached key + not in overwrite mode → return cache,
@@ -514,13 +582,21 @@ class DKIMVerifier:
                 self.stats['cache_hits'] += 1
                 self._lookup_outcomes[outcome_key] = 'hit'
 
-                # Update used_by_files and roles for this cached entry
-                if current_filename and current_filename not in entry['used_by_files']:
-                    entry['used_by_files'].append(current_filename)
-                if "roles" not in entry:
-                    entry["roles"] = ["dkim"]
-                if role and role not in entry["roles"]:
-                    entry["roles"].append(role)
+                # Update used_by_files and roles for this cached entry. A
+                # hand-written entry only has to carry domain/selector/key_data,
+                # so default the bookkeeping fields instead of indexing them.
+                used_by = entry.setdefault('used_by_files', [])
+                if not isinstance(used_by, list):
+                    used_by = entry['used_by_files'] = list(used_by or [])
+                roles = entry.setdefault('roles', [])
+                if not isinstance(roles, list):
+                    roles = entry['roles'] = list(roles or [])
+                if current_filename and current_filename not in used_by:
+                    used_by.append(current_filename)
+                    self._db_dirty = True
+                if role and role not in roles:
+                    roles.append(role)
+                    self._db_dirty = True
 
                 key_data = entry['key_data']
                 return key_data.encode('utf-8') if isinstance(key_data, str) else key_data
@@ -572,8 +648,11 @@ class DKIMVerifier:
           Typical when the sender has rotated selectors since the cache was
           built.
         """
+        bare_domain = (domain or '').rstrip('.')
         for v in self.key_database.values():
-            if v.get('domain') == domain and v.get('key_data'):
+            if not isinstance(v, dict):
+                continue
+            if (v.get('domain') or '').rstrip('.') == bare_domain and v.get('key_data'):
                 return 'OFFLINE-NO-KEY'
         return 'OFFLINE-NO-DOMAIN'
     
@@ -1508,8 +1587,28 @@ class DKIMVerifier:
         
         return dkim_results
     
+    @staticmethod
+    def _header_block_end(message_bytes):
+        """Offset of the blank line that ends the header block.
+
+        RFC 5322 terminates headers with CRLF CRLF, but extracted files are
+        often LF LF once a tool has rewritten them, so accept either and take
+        whichever comes first. Returns len(message_bytes) when the message has
+        no header/body separator at all.
+        """
+        crlf_end = message_bytes.find(b'\r\n\r\n')
+        lf_end = message_bytes.find(b'\n\n')
+        candidates = [pos for pos in (crlf_end, lf_end) if pos != -1]
+        return min(candidates) if candidates else len(message_bytes)
+
     def clean_gmail_export(self, message_bytes):
         """Remove Gmail export headers before Delivered-To to restore original email.
+
+        Works on the raw bytes. Decoding to str and re-encoding (which this used
+        to do) silently drops every byte that is not valid UTF-8 — 8-bit headers
+        and latin-1/cp1252 bodies are ordinary in mail — so the body changed
+        under a signature that was perfectly intact and the message was reported
+        as "body altered after signing".
 
         Only searches within the actual header section (before the headers/body
         separator). A naive whole-file search can match a Delivered-To: line
@@ -1518,33 +1617,27 @@ class DKIMVerifier:
         verification failure.
         """
         try:
-            # Convert to string for easier processing
-            message_str = message_bytes.decode('utf-8', errors='ignore')
+            header_end = self._header_block_end(message_bytes)
 
-            # Locate the end of the header block. RFC 5322 says CRLF CRLF; in
-            # practice files may use LF LF after extraction tools touch them.
-            crlf_end = message_str.find('\r\n\r\n')
-            lf_end = message_str.find('\n\n')
-            candidates = [pos for pos in (crlf_end, lf_end) if pos != -1]
-            header_end = min(candidates) if candidates else len(message_str)
-
-            # Only search for Delivered-To within the header section.
-            delivered_to_pattern = re.compile(r'^delivered-to:', re.MULTILINE | re.IGNORECASE)
-            match = delivered_to_pattern.search(message_str, 0, header_end)
+            # Header lines only: anchored at a line start inside the header block,
+            # with any folded continuation lines consumed as part of the header
+            # that is being removed.
+            delivered_to_pattern = re.compile(
+                rb'^delivered-to:[^\r\n]*(?:\r\n[ \t][^\r\n]*)*',
+                re.MULTILINE | re.IGNORECASE,
+            )
+            match = delivered_to_pattern.search(message_bytes[:header_end])
 
             if match and match.start() > 0:
-                # Extract everything from Delivered-To onward
-                cleaned_content = message_str[match.start():]
+                cleaned_bytes = message_bytes[match.start():]
                 self.log(f"Found Delivered-To at position {match.start()}, removing {match.start()} bytes of Gmail headers")
+                return cleaned_bytes, True
 
-                # Convert back to bytes
-                return cleaned_content.encode('utf-8'), True
+            if match:
+                self.log("Delivered-To is already the first header; nothing to clean")
             else:
-                if match:
-                    self.log("Delivered-To is already the first header; nothing to clean")
-                else:
-                    self.log("No Delivered-To header in header block, using original content")
-                return message_bytes, False
+                self.log("No Delivered-To header in header block, using original content")
+            return message_bytes, False
 
         except Exception as e:
             self.log(f"Error cleaning Gmail export: {e}")
@@ -1565,12 +1658,17 @@ class DKIMVerifier:
             analysis['gmail_headers_removed'] = True
             analysis['bytes_removed'] = len(original_bytes) - len(cleaned_bytes)
         
-        # Check line endings
-        if b'\r\n' in cleaned_bytes and b'\n' in cleaned_bytes:
+        # Check line endings. A CRLF file always contains b'\n' as part of
+        # every CRLF pair, so testing "CRLF present AND LF present" labels
+        # every Windows-style message "mixed" and the report then advises
+        # dos2unix on every run. Count the LF bytes that are not part of a
+        # CRLF pair instead.
+        bare_lf = cleaned_bytes.replace(b'\r\n', b'').count(b'\n')
+        if b'\r\n' in cleaned_bytes and bare_lf:
             analysis['line_endings'] = 'mixed'
         elif b'\r\n' in cleaned_bytes:
             analysis['line_endings'] = 'CRLF'
-        elif b'\n' in cleaned_bytes:
+        elif bare_lf:
             analysis['line_endings'] = 'LF'
         
         # Look for potentially problematic headers still remaining
@@ -1908,17 +2006,29 @@ class DKIMVerifier:
             report_lines.append("KEY DATABASE DETAILS:")
             report_lines.append("-" * 40)
             for cache_key, key_info in sorted(self.key_database.items()):
-                report_lines.append(f"Key: {cache_key}")
-                report_lines.append(f"  DNS Query: {key_info['dns_query']}")
-                report_lines.append(f"  Status: {key_info['status']}")
-                report_lines.append(f"  Retrieved: {key_info['retrieved'][:19]}")
-                report_lines.append(f"  Used by {len(key_info['used_by_files'])} files")
+                if not isinstance(key_info, dict):
+                    key_info = {}
+                status = key_info.get('status') or 'unknown'
+                retrieved = str(key_info.get('retrieved') or '')[:19]
+                used_by = key_info.get('used_by_files') or []
+                if not isinstance(used_by, (list, tuple, set)):
+                    used_by = [used_by]
                 roles = key_info.get('roles') or ['dkim']
-                report_lines.append(f"  Roles: {', '.join(roles)}")
-                if key_info.get('parsed_key', {}).get('k'):
-                    report_lines.append(f"  Key type: {key_info['parsed_key']['k']}")
-                if key_info['status'] != 'success':
-                    report_lines.append(f"  Issue: {key_info['status']}")
+                if not isinstance(roles, (list, tuple, set)):
+                    roles = [roles]
+                parsed_key = key_info.get('parsed_key') or {}
+                if not isinstance(parsed_key, dict):
+                    parsed_key = {}
+                report_lines.append(f"Key: {cache_key}")
+                report_lines.append(f"  DNS Query: {key_info.get('dns_query') or '(not recorded)'}")
+                report_lines.append(f"  Status: {status}")
+                report_lines.append(f"  Retrieved: {retrieved or '(not recorded)'}")
+                report_lines.append(f"  Used by {len(used_by)} files")
+                report_lines.append(f"  Roles: {', '.join(str(r) for r in roles)}")
+                if parsed_key.get('k'):
+                    report_lines.append(f"  Key type: {parsed_key['k']}")
+                if status != 'success':
+                    report_lines.append(f"  Issue: {status}")
                 report_lines.append("")
         
         # Detailed results
@@ -2068,8 +2178,8 @@ class DKIMVerifier:
             report_lines.append("-" * 40)
             if gmail_cleaned_count > 0:
                 report_lines.append("✓ Gmail export headers automatically cleaned")
-            if line_ending_stats.get('mixed', 0) > 0 or line_ending_stats.get('CRLF', 0) > 0:
-                report_lines.append("• Line ending issues detected - consider using 'dos2unix' or checking mbox extraction")
+            if line_ending_stats.get('mixed', 0) > 0 or line_ending_stats.get('LF', 0) > 0:
+                report_lines.append("• Mixed or LF-only line endings detected - DKIM signs CRLF, so check how the mailbox was extracted")
             if extra_header_count > 0:
                 report_lines.append("• Extra headers still detected after cleaning")
             if self.stats['valid_dkim'] > self.stats['invalid_dkim']:
@@ -2253,7 +2363,18 @@ class DKIMVerifier:
         }
 
 
-def main():
+def _percent(value):
+    """argparse type for a 0-100 percentage."""
+    try:
+        percent = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}")
+    if not 0 <= percent <= 100:
+        raise argparse.ArgumentTypeError(f"must be between 0 and 100, got {value}")
+    return percent
+
+
+def main(argv=None):
     # The help text, the report's verdict glyphs and message headers all carry
     # characters a legacy console code page cannot encode, and an encode error
     # raised mid-run aborts it -- losing the report, the key database save and
@@ -2334,7 +2455,14 @@ def main():
                              'exists, and the cached entry is replaced. Incompatible '
                              'with --offline-only.')
 
-    args = parser.parse_args()
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    parser.add_argument('--fail-under', type=_percent, default=None, metavar='PERCENT',
+                        help='Exit with status 3 when fewer than PERCENT of the scanned '
+                             'files verify. The denominator is every file scanned, so '
+                             'unsigned mail counts against the rate; useful as a gate on '
+                             'a known-good mailbox export.')
+
+    args = parser.parse_args(argv)
 
     # With JSON on stdout, stdout belongs to the JSON alone; everything a human
     # reads moves to stderr so a consumer can parse stdout unconditionally.
@@ -2346,14 +2474,6 @@ def main():
     if args.offline_only and args.overwrite_keys:
         parser.error('--offline-only and --overwrite-keys are incompatible '
                      '(one says "no DNS", the other says "DNS and replace")')
-    
-    # Check dependencies
-    if not DKIM_AVAILABLE:
-        print("Warning: dkimpy library not available. Using simplified verification.",
-              file=console)
-        print("For full DKIM verification, install with: pip install dkimpy dnspython",
-              file=console)
-        print(file=console)
     
     # Run verification
     verifier = DKIMVerifier(
@@ -2393,7 +2513,22 @@ def main():
         # Save key database if specified
         if args.key_database:
             verifier.save_key_database()
-        
+
+        # Optional CI gate. Runs after the report, the JSON payload and the key
+        # database are written, so a failing run still leaves its evidence.
+        if args.fail_under is not None:
+            total = verifier.stats['total_files']
+            if not total:
+                print(f"--fail-under {args.fail_under:g}: no files were verified",
+                      file=console)
+                sys.exit(3)
+            verified_rate = verifier.stats['valid_dkim'] / total * 100
+            if verified_rate < args.fail_under:
+                print(f"--fail-under {args.fail_under:g}: only {verified_rate:.1f}% of "
+                      f"{total} files verified ({verifier.stats['valid_dkim']} passed)",
+                      file=console)
+                sys.exit(3)
+
         # A high failure rate only points at extraction problems when failures
         # are NOT explained by unavailable keys. Revoked/rotated keys and
         # body-intact signature failures are expected for older mail and have

@@ -224,6 +224,7 @@ __marimo__/
 # verify_dkim_signatures.py runtime artifacts
 key-database.json
 key-database.json.bak
+key-database.json.tmp
 
 # .eml files (test corpora, user emails, generated .fixed.eml) — never commit
 *.eml
