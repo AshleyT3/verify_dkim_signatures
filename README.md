@@ -33,8 +33,22 @@ The opt-in fix mode (`--attempt-fix`) tries to reverse every modification this s
 
 ## Requirements
 
-- Python 3
-- `pip install dkimpy dnspython`
+- Python 3.9 or newer
+- `dkimpy` and `dnspython`
+
+## Install
+
+```bash
+# as a command on your PATH (recommended)
+pipx install .
+
+# or run the script straight from a checkout
+pip install dkimpy dnspython
+python verify_dkim_signatures.py --help
+```
+
+Installing provides the `verify-dkim` command; `python -m verify_dkim_signatures`
+does the same thing, from an installed copy or a checkout.
 
 ## Quick start
 
@@ -59,6 +73,9 @@ python verify_dkim_signatures.py --offline-only ./emails/
 
 # Machine-readable results for scripting (stdout carries the JSON alone):
 python verify_dkim_signatures.py --json - ./emails/
+
+# Installed as a command, the same run is just:
+verify-dkim --offline-only ./emails/
 ```
 
 ## CLI
@@ -77,6 +94,21 @@ python verify_dkim_signatures.py --json - ./emails/
 | `--offline-only` | never query DNS; verify against cached keys only |
 | `--overwrite-keys` | allow DNS to refresh cached keys (off by default — cached keys are kept forever) |
 | `--json PATH` | also emit the complete per-file results as JSON; `-` sends them to stdout |
+| `--fail-under PERCENT` | exit with status 3 when fewer than PERCENT of the scanned files verify — the denominator is every file scanned, so unsigned mail counts against the rate |
+| `--version` | print the version and exit |
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | the run completed — individual emails may still have failed verification |
+| `1` | the run could not complete (runtime error) |
+| `2` | usage error: unknown flag, an out-of-range `--fail-under`, or a missing dependency |
+| `3` | `--fail-under` was given and the verified share came in below it |
+
+Without `--fail-under`, a run in which every signature fails still exits `0`:
+the verdicts are the output, not the exit status. Pass `--fail-under` when you
+want a script or scheduled job to fail on a drop.
 
 ## Naming the files to verify
 
@@ -130,7 +162,11 @@ public keys indexed by domain and selector, and records no verdicts at all. Its
 
 Every DKIM/ARC public key the tool fetches from DNS is saved to `key-database.json`. By default, once a key is cached it is **never overwritten** — this matters for archived emails, where the sender's DNS record may eventually disappear (selector rotation, domain expiration, key revocation). The cached key is then your only way to verify the signature.
 
-On each save the previous file is rotated to `key-database.json.bak`.
+Saves only happen when something changed, and they are atomic: the file is
+written to a temporary name and moved into place, so an interrupted run cannot
+leave a half-written database. A run that only reads cached keys does not touch
+the file at all. When a change is saved, the previous file is rotated to
+`key-database.json.bak`.
 
 Use `--overwrite-keys` to opt in to refreshing cached keys from DNS.
 
@@ -147,6 +183,19 @@ For reference, these are the specific body changes the fix mode knows how to rev
 - Trailing space stripped from certain attached-message header lines
 - `Bcc:` header reformatting inside attached `.eml` parts
 - `MIME-Version:` repositioning inside attached `.eml` parts
+
+## Development
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest   # offline: no DNS, no network
+.venv/bin/ruff check .
+```
+
+The test suite signs its own messages with locally generated RSA keys and
+points every verifier at a temporary key database, so it needs neither network
+access nor a real mailbox.
 
 ## License
 
